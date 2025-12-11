@@ -8,7 +8,9 @@ Usage:
 python3 -m venv mlxmonitoring
 source mlxmonitoring/bin/activate
 pip3 install tabulate
-pip3 install pynvml
+pip3 install pynvml #For NVIDIA GPUs
+pip3 install pyrsmi #For AMD GPUs. Might fail on some OS/Kernel version
+pip3 install rich
 
 ## For RoCE/Eth (from ethtool statistics):
 python3 monitorv2.py
