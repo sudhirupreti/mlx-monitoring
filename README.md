@@ -10,6 +10,10 @@ source mlxmonitoring/bin/activate
 pip3 install tabulate
 pip3 install pynvml #For NVIDIA GPUs
 pip3 install pyrsmi #For AMD GPUs. Might fail on some OS/Kernel version
+#Or
+git clone https://github.com/ROCm/pyrsmi
+python -m pip install -e . #Needs Python >= Python 3.9
+#AMD stats might not work with v < 7.x
 pip3 install rich
 
 ## For RoCE/Eth (from ethtool statistics):
