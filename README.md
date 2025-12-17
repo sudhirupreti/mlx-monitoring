@@ -3,6 +3,8 @@
 This is built on top of Marcin Zablocki's Mellanox Monitoring tool:
 https://github.com/MarcinZablocki/mlx_monitor/
 
+Dumping to csv file is still in the works after some changes to the code. Currently, its can only dump GPU stats.
+
 Usage:
 ```bash
 python3 -m venv mlxmonitoring
@@ -106,14 +108,6 @@ GPU-4  ······························         0   
 GPU-5  ······························         0           0  ······························      0.8        0.8  37C     105W / 400W  1410 MHz         1215 MHz
 GPU-6  ······························         0           0  ······························      0.8        0.8  39C     104W / 400W  1410 MHz         1215 MHz
 GPU-7  ······························         0           0  ······························      0.8        0.8  40C     104W / 400W  1410 MHz         1215 MHz
-
-
-
-#To dump stats to a csv file
-python3 monitorv2.py --dump
-##or
-python3 monitorv2.py --ib --dump
-
 
 
 #Version3 monitorv3.py
