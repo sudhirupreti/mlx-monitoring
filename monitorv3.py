@@ -89,13 +89,29 @@ net_max = {dev["mlx"]: {"rx": 0, "tx": 0} for dev in ibd}
 last_net_bytes = {}
 
 def get_net_sample(mlx, port):
+    rx_bytes = tx_bytes = None
+    # Try to get *_bytes_phy with ethtool -S
     try:
-        with open(f"/sys/class/net/{port}/statistics/rx_bytes") as f:
-            rx_bytes = int(f.read())
-        with open(f"/sys/class/net/{port}/statistics/tx_bytes") as f:
-            tx_bytes = int(f.read())
+        ethtool_output = subprocess.run(['ethtool', '-S', port], capture_output=True, text=True, check=True)
+        # Use regular expressions to find rx_bytes_phy and tx_bytes_phy
+        rx_match = re.search(r'rx_bytes_phy:\s*(\d+)', ethtool_output.stdout)
+        tx_match = re.search(r'tx_bytes_phy:\s*(\d+)', ethtool_output.stdout)
+        if rx_match and tx_match:
+            rx_bytes = int(rx_match.group(1))
+            tx_bytes = int(tx_match.group(1))
     except Exception:
-        return 0, 0
+        pass
+
+    # Fallback to legacy statistics if *_bytes_phy not found/fails
+    if rx_bytes is None or tx_bytes is None:
+        try:
+            with open(f"/sys/class/net/{port}/statistics/rx_bytes") as f:
+                rx_bytes = int(f.read())
+            with open(f"/sys/class/net/{port}/statistics/tx_bytes") as f:
+                tx_bytes = int(f.read())
+        except Exception:
+            return 0, 0
+
     now = time.time()
     key = f"{mlx}_{port}"
     prev = last_net_bytes.get(key)
