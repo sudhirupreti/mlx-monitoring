@@ -4,6 +4,7 @@ This is built on top of Marcin Zablocki's Mellanox Monitoring tool:
 https://github.com/MarcinZablocki/mlx_monitor/
 
 Dumping to csv file is still in the works after some changes to the code. Currently, its can only dump GPU stats.
+pyrsmi works in certain cases (its broken), and might not work for other cases. Code has been changed to fall back to amd-smi if pyrsmi does not work. Ultimately, we want to get stats from pyrsmi (but it might take some time for it be more mature).
 
 Usage:
 ```bash
