@@ -3,7 +3,7 @@
 This is built on top of Marcin Zablocki's Mellanox Monitoring tool:
 https://github.com/MarcinZablocki/mlx_monitor/
 
-pyrsmi works in certain cases (its broken), and might not work for other cases. Code has been changed to fall back to amd-smi if pyrsmi does not work, and further to amd-smi monitor. Ultimately, we want to get stats from pyrsmi (but it might take some time for it be more mature).
+pyrsmi works in certain cases (its broken), and might not work for other cases. Code has been changed to fall back to amd-smi if pyrsmi does not work, and further to amd-smi monitor if amd-smi does not work. Ultimately, we want to get stats from pyrsmi (but it might take some time for it be more mature).
 
 Usage:
 ```bash
