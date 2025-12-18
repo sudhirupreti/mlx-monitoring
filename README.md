@@ -112,6 +112,9 @@ GPU-6  ······························         0   
 GPU-7  ······························         0           0  ······························      0.8        0.8  40C     104W / 400W  1410 MHz         1215 MHz
 
 
+Recommendation is to use version v3 of the script i.e. monitorv3.py.
+
+
 #Version3 monitorv3.py
 #Usage
 python3 monitorv3.py --nvidia --ib
@@ -143,5 +146,9 @@ python3 monitorv3.py --nvidia --ib
 │ └───────┴────────┴──────────┴────────────────┴──────────────┴───────┴───────────┴──────┴────────────┴───────────────┴───────────────┘                                                                             │
 ╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
                                                                                                                                                                                                                      
+
 #Similar for AMD
 python3 monitorv3.py --amd --ib
+
+## To Dump stats to a csv file for the duration of the run of the script (works with --nvidia and --ib options as well):
+python3 monitorv3.py --amd --dump
