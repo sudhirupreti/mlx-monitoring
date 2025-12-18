@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import argparse
 import csv
 import os
@@ -8,7 +7,6 @@ from collections import deque
 from datetime import datetime
 import re
 import subprocess
-
 from rich.console import Console, Group
 from rich.table import Table
 from rich.live import Live
@@ -27,6 +25,7 @@ args = parser.parse_args()
 
 HISTORY_LEN = 30
 archive_rows = [] if args.dump else None
+amd_count = 0  # ensure defined for CSV dump at shutdown
 
 # ===================== Network Section =======================
 def get_ib_devices():
@@ -37,7 +36,10 @@ def get_ib_devices():
         return ib_devices
     for dev in devs:
         if 'mlx' in dev:
-            net_devs = os.listdir(f'/sys/class/infiniband/{dev}/device/net')
+            try:
+                net_devs = os.listdir(f'/sys/class/infiniband/{dev}/device/net')
+            except Exception:
+                net_devs = []
             if net_devs:
                 ib_devices.append({"mlx": dev, "port": net_devs[0]})
     return ib_devices
@@ -101,7 +103,6 @@ def get_net_sample(mlx, port):
             tx_bytes = int(tx_match.group(1))
     except Exception:
         pass
-
     # Fallback to legacy statistics if *_bytes_phy not found/fails
     if rx_bytes is None or tx_bytes is None:
         try:
@@ -111,7 +112,6 @@ def get_net_sample(mlx, port):
                 tx_bytes = int(f.read())
         except Exception:
             return 0, 0
-
     now = time.time()
     key = f"{mlx}_{port}"
     prev = last_net_bytes.get(key)
@@ -139,7 +139,10 @@ def get_drop_sample(iface):
 # RDMA per-priority stats (for RDMA/IPoIB mode)
 def find_rdma_nics():
     rdma_list = []
-    for mlx in sorted(os.listdir("/sys/class/infiniband")):
+    base = "/sys/class/infiniband"
+    if not os.path.exists(base):
+        return rdma_list
+    for mlx in sorted(os.listdir(base)):
         if not mlx.startswith("mlx"):
             continue
         ports_path = f"/sys/class/infiniband/{mlx}/ports"
@@ -156,6 +159,9 @@ def find_rdma_nics():
                 continue
     return rdma_list
 
+# Stable list for headers and row ordering
+rdma_devices_static = find_rdma_nics()
+
 last_rdma_counters = {}
 def get_rdma_delta(mlx, port, nic):
     global last_rdma_counters
@@ -163,18 +169,15 @@ def get_rdma_delta(mlx, port, nic):
         output = os.popen(f"ethtool -S {nic}").read()
     except Exception:
         return [0]*8, [0]*8
-
     rx_vals, tx_vals = [], []
     for i in range(8):
         m = re.search(rf"rx_prio{i}_bytes:\s*(\d+)", output)
         rx_vals.append(int(m.group(1)) if m else 0)
         m = re.search(rf"tx_prio{i}_bytes:\s*(\d+)", output)
         tx_vals.append(int(m.group(1)) if m else 0)
-
     key = f"{mlx}_{port}_{nic}"
     now = time.time()
     prev = last_rdma_counters.get(key)
-
     if prev is None:
         rx_delta, tx_delta = [0]*8, [0]*8
         dt = 1.0
@@ -185,7 +188,6 @@ def get_rdma_delta(mlx, port, nic):
             dt = 1.0
         rx_delta = [(rx_vals[i]-prev_rx[i])/dt for i in range(8)]
         tx_delta = [(tx_vals[i]-prev_tx[i])/dt for i in range(8)]
-
     last_rdma_counters[key] = (rx_vals, tx_vals, now)
     rx_delta_gbps = [v*8/1e9 for v in rx_delta]
     tx_delta_gbps = [v*8/1e9 for v in tx_delta]
@@ -213,11 +215,7 @@ def get_rocm_smi_clocks_all(gpu_count):
     return clocks
 
 # === AMD GPU Section ===
-import subprocess
-import re
-
 amd_gpu_max = {}
-
 def update_max(gpu_idx, util, mem_used_gb, power):
     global amd_gpu_max
     if gpu_idx not in amd_gpu_max:
@@ -227,10 +225,66 @@ def update_max(gpu_idx, util, mem_used_gb, power):
         amd_gpu_max[gpu_idx]['mem_used_gb'] = max(amd_gpu_max[gpu_idx]['mem_used_gb'], mem_used_gb)
         amd_gpu_max[gpu_idx]['power'] = max(amd_gpu_max[gpu_idx]['power'], power)
 
+def parse_amd_smi_monitor(output):
+    """
+    Parse `amd-smi monitor` one-shot output.
+    Returns list of dicts per GPU with keys:
+    idx, power_w, temp_c, gfx_util, vram_used_gb, vram_total_gb
+    """
+    gpus = []
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    if not lines:
+        return gpus
+    # Skip header; parse subsequent lines
+    for ln in lines[1:]:
+        m = re.search(
+            r'^(\d+)\s+'          # GPU index
+            r'(\d+)\s*W\s+'       # POWER W
+            r'(\d+)\s*°C\s+'      # GPU_T
+            r'(\d+)\s*°C\s+'      # MEM_T (ignored)
+            r'(\d+)\s*MHz\s+'     # GFX_CLK (ignored)
+            r'(\d+)\s*%\s+'       # GFX% (util)
+            r'(\d+|N/A)\s*%\s+'   # MEM% (ignored)
+            r'(?:\S+)\s+'         # ENC% (may be N/A)
+            r'(\d+|N/A)\s*%\s+'   # DEC% (ignored)
+            r'([\d.]+)\/([\d.]+)\s*GB$',  # VRAM_USAGE used/total
+            ln
+        )
+        if not m:
+            # fallback split-based parse
+            parts = ln.split()
+            try:
+                idx = int(parts[0])
+                power_w = int(parts[1])
+                temp_c = int(parts[3])
+                gfx_util = int(parts[7])
+                vram_pair = parts[-2]  # e.g., "0.3/192.0"
+                used_s, total_s = vram_pair.split("/")
+                vram_used_gb = float(used_s)
+                vram_total_gb = float(total_s)
+                gpus.append({
+                    "idx": idx, "power_w": power_w, "temp_c": temp_c,
+                    "gfx_util": gfx_util, "vram_used_gb": vram_used_gb, "vram_total_gb": vram_total_gb
+                })
+            except Exception:
+                continue
+        else:
+            idx = int(m.group(1))
+            power_w = int(m.group(2))
+            temp_c = int(m.group(3))
+            gfx_util = int(m.group(6))
+            vram_used_gb = float(m.group(9))
+            vram_total_gb = float(m.group(10))
+            gpus.append({
+                "idx": idx, "power_w": power_w, "temp_c": temp_c,
+                "gfx_util": gfx_util, "vram_used_gb": vram_used_gb, "vram_total_gb": vram_total_gb
+            })
+    return gpus
+
 def get_amd_gpu_stats_rocml():
     stats = []
     amd_gpu_values = []
-    amd_count = 0
+    amd_count_local = 0
 
     # --- First try pyrsmi ---
     try:
@@ -260,7 +314,6 @@ def get_amd_gpu_stats_rocml():
                         "Power Max (W)": amd_gpu_max[i]["power"],
                         "Temp": temp,
                     }
-                    # Skip N/A
                     row = {k: v for k, v in row.items() if v not in [None, "N/A"]}
                     stats.append(row)
                     amd_gpu_values.extend([
@@ -273,15 +326,15 @@ def get_amd_gpu_stats_rocml():
                     ])
                 except Exception:
                     continue
-            amd_count = len(stats)
+            amd_count_local = len(stats)
             rocml.smi_shutdown()
-            return stats, amd_gpu_values, amd_count
+            return stats, amd_gpu_values, amd_count_local
     except Exception:
         pass  # Continue to CLI fallback
 
-    # --- Fallback on amd-smi CLI ---
+    # --- Fallback on amd-smi CLI (table mode) ---
     try:
-        out = subprocess.check_output(['amd-smi'], encoding='utf-8', errors='ignore')
+        out = subprocess.check_output(['amd-smi'], encoding='utf-8', errors='ignore', timeout=3)
         cli_pattern = re.compile(
             r"\|\s+([0-9a-fA-F:.]+)\s+(.*?)\s+\|\s+(\d+) %\s+(\d+) °C.*?(\d+)/(\d+)\s+W.*?\n\|\s+\d+\s+\d+\s+\d+\s+\S+\s+\|\s+(\d+) %\s+([N/A\d\.\-%]+)\s+(\d+)/(\d+)\s+MB",
             re.DOTALL)
@@ -291,12 +344,11 @@ def get_amd_gpu_stats_rocml():
                 raw_name = m.group(2)
                 name = " ".join(raw_name.split())
                 if "GPU-Name" in name:
-                    continue  # Don't process header lines
+                    continue
                 temp = int(m.group(4))
                 power_used = int(m.group(5))
                 power_max = int(m.group(6))
                 gfx_util = int(m.group(7))
-                # fan = m.group(8).strip()
                 mem_used = float(m.group(9))
                 mem_total = float(m.group(10))
                 mem_used_gb = mem_used / 1024
@@ -313,7 +365,6 @@ def get_amd_gpu_stats_rocml():
                     "Power Max (W)": amd_gpu_max[gpu_idx]["power"],
                     "Temp": temp,
                 }
-                # Skip N/A
                 row = {k: v for k, v in row.items() if v not in [None, "N/A"]}
                 stats.append(row)
                 amd_gpu_values.extend([
@@ -326,8 +377,56 @@ def get_amd_gpu_stats_rocml():
                 ])
             except Exception:
                 continue
-        amd_count = len(stats)
-        return stats, amd_gpu_values, amd_count
+        amd_count_local = len(stats)
+        if amd_count_local > 0:
+            return stats, amd_gpu_values, amd_count_local
+    except Exception:
+        pass
+
+    # --- Second fallback: amd-smi monitor (works on older <7.x in many envs) ---
+    try:
+        # Run with a short timeout in case 'monitor' streams continuously
+        res = subprocess.run(['amd-smi', 'monitor'], capture_output=True, text=True, timeout=2)
+        out = res.stdout
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "") if hasattr(e, 'stdout') else ""
+    except Exception:
+        out = ""
+
+    try:
+        gpu_rows = parse_amd_smi_monitor(out)
+        for g in gpu_rows:
+            i = g["idx"]
+            name = f"GPU-{i}"
+            gfx_util = g["gfx_util"]
+            power_used = g["power_w"]
+            temp = g["temp_c"]
+            mem_used_gb = g["vram_used_gb"]
+            mem_total_gb = g["vram_total_gb"]
+            update_max(i, gfx_util, mem_used_gb, power_used)
+            row = {
+                "GPU": i,
+                "Name": name,
+                "Util (%)": gfx_util,
+                "Util Max": amd_gpu_max[i]["util"],
+                "Mem Usage (GB)": f"{mem_used_gb:.1f}/{mem_total_gb:.1f}",
+                "Mem Max (GB)": f"{amd_gpu_max[i]['mem_used_gb']:.1f}/{mem_total_gb:.1f}",
+                "Power (W)": power_used,
+                "Power Max (W)": amd_gpu_max[i]["power"],
+                "Temp": temp,
+            }
+            stats.append(row)
+            amd_gpu_values.extend([
+                gfx_util,
+                amd_gpu_max[i]["util"],
+                mem_used_gb,
+                amd_gpu_max[i]['mem_used_gb'],
+                power_used,
+                temp,
+            ])
+        amd_count_local = len(gpu_rows)
+        if amd_count_local > 0:
+            return stats, amd_gpu_values, amd_count_local
     except Exception:
         pass
 
@@ -350,6 +449,7 @@ if args.nvidia:
                     for i in range(deviceCount)}
     gpu_max = {i: {"gpu": 0, "mem": 0, "mem_gb": 0} for i in range(deviceCount)}
 
+# ==== CSV DUMP SUPPORT ====
 def dump_archive_csv(filename_prefix="stats_dump", is_amd=False, amd_count=0):
     if not args.dump or not archive_rows:
         print("[WARN] Dump mode not enabled or no data recorded.")
@@ -357,21 +457,38 @@ def dump_archive_csv(filename_prefix="stats_dump", is_amd=False, amd_count=0):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{filename_prefix}_{ts}.csv"
     headers = ["timestamp"]
+    # GPU headers
     if is_amd:
         for i in range(amd_count):
-            headers += [f"AMD_GPU{i}_Util", f"AMD_GPU{i}_UtilMax", f"AMD_GPU{i}_Mem", f"AMD_GPU{i}_MemMax", f"AMD_GPU{i}_Power", f"AMD_GPU{i}_Temp"]
+            headers += [f"AMD_GPU{i}_Util", f"AMD_GPU{i}_UtilMax",
+                        f"AMD_GPU{i}_Mem", f"AMD_GPU{i}_MemMax",
+                        f"AMD_GPU{i}_Power", f"AMD_GPU{i}_Temp"]
     else:
         for i in range(deviceCount):
             headers += [f"GPU{i}_Util", f"GPU{i}_Mem", f"GPU{i}_Temp", f"GPU{i}_Power"]
-    for dev in ibd:
-        mlx = dev["mlx"]
-        if args.ib:
-            headers += [f"{mlx}_TX_Packets", f"{mlx}_RX_Packets", f"{mlx}_TX_Gbps", f"{mlx}_RX_Gbps",
-                        f"{mlx}_TX_Max", f"{mlx}_RX_Max",
-                        f"{mlx}_TX_Discards", f"{mlx}_RX_Errors", f"{mlx}_Symbol_Errors",
-                        f"{mlx}_Link_Downs", f"{mlx}_Link_Recovery"]
-        else:
-            headers += [f"{mlx}_RX", f"{mlx}_TX", f"{mlx}_RX_Drop", f"{mlx}_TX_Drop"]
+    # Network headers
+    if args.ib:
+        for dev in ibd:
+            mlx = dev["mlx"]
+            headers += [
+                f"{mlx}_TX_Packets", f"{mlx}_RX_Packets",
+                f"{mlx}_TX_Gbps", f"{mlx}_RX_Gbps",
+                f"{mlx}_TX_Max", f"{mlx}_RX_Max",
+                f"{mlx}_TX_Discards", f"{mlx}_RX_Errors",
+                f"{mlx}_Symbol_Errors", f"{mlx}_Link_Downs",
+                f"{mlx}_Link_Recovery"
+            ]
+    else:
+        # Basic NIC stats per mlx
+        for dev in ibd:
+            mlx = dev["mlx"]
+            headers += [f"{mlx}_RX_Gbps", f"{mlx}_TX_Gbps", f"{mlx}_RX_Drop", f"{mlx}_TX_Drop",
+                        f"{mlx}_RX_Max", f"{mlx}_TX_Max"]
+        # RDMA per-priority stats
+        for (mlx, port, nic) in rdma_devices_static:
+            headers += [f"{mlx}_{nic}_RX_P{i}" for i in range(8)]
+            headers += [f"{mlx}_{nic}_TX_P{i}" for i in range(8)]
+            headers += [f"{mlx}_{nic}_TOTAL_RX", f"{mlx}_{nic}_TOTAL_TX"]
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(headers)
@@ -417,7 +534,7 @@ def make_rdma_table():
     table = Table(title="RDMA NIC priority Bandwidth (Gbps)", show_lines=False)
     for col, minw, maxw in hdrs:
         table.add_column(col, justify="right", min_width=minw, max_width=maxw, no_wrap=True)
-    rdma_devices = find_rdma_nics()
+    rdma_devices = rdma_devices_static
     for mlx, port, nic in rdma_devices:
         rx_delta_mb, tx_delta_mb = get_rdma_delta(mlx, port, nic)
         total_rx = sum(rx_delta_mb)
@@ -425,6 +542,7 @@ def make_rdma_table():
         row = [f"{mlx}:{port}"] + [f"{x:7.2f}" for x in rx_delta_mb] + [f"{x:7.2f}" for x in tx_delta_mb] + [f"{total_rx:7.2f}", f"{total_tx:7.2f}"]
         table.add_row(*row)
     return table
+
 def make_ib_table():
     table = Table(title="InfiniBand Fabric Port Counters", show_lines=False)
     for col in [
@@ -465,7 +583,7 @@ def make_amd_gpu_table(stats):
     table = Table(title="AMD GPU Stats", show_lines=False)
     hdrs = [
         ("GPU", 3, 3),
-        ("Name", 20, 24),  # Room for MI300X etc.
+        ("Name", 20, 24),
         ("Util (%)", 8, 8),
         ("Util Max", 9, 9),
         ("Mem Usage (GB)", 16, 16),
@@ -483,7 +601,7 @@ def make_amd_gpu_table(stats):
         table.add_row(
             str(row.get("GPU", "")),
             str(row.get("Name", "")),
-            f"{row.get('Util (%)', 0):>7}",    # e.g. "   100"
+            f"{row.get('Util (%)', 0):>7}",
             f"{row.get('Util Max', 0):>8}",
             f"{row.get('Mem Usage (GB)', '0.0/0.0'):>15}",
             f"{row.get('Mem Max (GB)', '0.0/0.0'):>15}",
@@ -495,6 +613,7 @@ def make_amd_gpu_table(stats):
             f"{row.get('SOCCLK (MHz)', ''):>8}",
         )
     return table
+
 def make_nvidia_gpu_table(stats):
     table = Table(title="NVIDIA GPU Stats", show_lines=False)
     hdr = [
@@ -507,25 +626,86 @@ def make_nvidia_gpu_table(stats):
         table.add_row(*[str(x) for x in row])
     return table
 
+# ==== Helpers to gather values for CSV rows ====
+def sample_ib_values():
+    row_vals = []
+    for dev in ibd:
+        mlx = dev["mlx"]
+        counters = get_ib_fabric_counters(mlx, port='1')
+        now = time.time()
+        key = f"{mlx}_1"
+        cur_tx_data = counters["port_xmit_data"]
+        cur_rx_data = counters["port_rcv_data"]
+        prev = last_ib_fabric_counters.get(key)
+        if prev is not None:
+            prev_time, prev_tx_data, prev_rx_data = prev
+            dt = now - prev_time
+            tx_gbps = ((cur_tx_data - prev_tx_data) * 4 * 8) / (dt * 1e9)
+            rx_gbps = ((cur_rx_data - prev_rx_data) * 4 * 8) / (dt * 1e9)
+        else:
+            tx_gbps = rx_gbps = 0.0
+        last_ib_fabric_counters[key] = (now, cur_tx_data, cur_rx_data)
+        ib_net_max[mlx]["tx"] = max(ib_net_max[mlx]["tx"], tx_gbps)
+        ib_net_max[mlx]["rx"] = max(ib_net_max[mlx]["rx"], rx_gbps)
+        row_vals += [
+            counters.get("port_xmit_packets", 0),
+            counters.get("port_rcv_packets", 0),
+            f"{tx_gbps:.4f}", f"{rx_gbps:.4f}",
+            f"{ib_net_max[mlx]['tx']:.4f}", f"{ib_net_max[mlx]['rx']:.4f}",
+            counters.get("port_xmit_discards", 0),
+            counters.get("port_rcv_errors", 0),
+            counters.get("symbol_error", 0),
+            counters.get("link_downed", 0),
+            counters.get("link_error_recovery", 0)
+        ]
+    return row_vals
+
+def sample_nic_values():
+    row_vals = []
+    for dev in ibd:
+        mlx, port = dev["mlx"], dev["port"]
+        rx_gbps, tx_gbps = get_net_sample(mlx, port)
+        net_history[mlx]["rx"].append(rx_gbps)
+        net_history[mlx]["tx"].append(tx_gbps)
+        net_max[mlx]["rx"] = max(net_max[mlx]["rx"], rx_gbps)
+        net_max[mlx]["tx"] = max(net_max[mlx]["tx"], tx_gbps)
+        rx_drp, tx_drp = get_drop_sample(port)
+        row_vals += [f"{rx_gbps:.4f}", f"{tx_gbps:.4f}", rx_drp, tx_drp,
+                     f"{net_max[mlx]['rx']:.4f}", f"{net_max[mlx]['tx']:.4f}"]
+    return row_vals
+
+def sample_rdma_values():
+    row_vals = []
+    for (mlx, port, nic) in rdma_devices_static:
+        rx_prios, tx_prios = get_rdma_delta(mlx, port, nic)
+        total_rx = sum(rx_prios)
+        total_tx = sum(tx_prios)
+        row_vals += [f"{x:.4f}" for x in rx_prios]
+        row_vals += [f"{x:.4f}" for x in tx_prios]
+        row_vals += [f"{total_rx:.4f}", f"{total_tx:.4f}"]
+    return row_vals
+
 # ==== MAIN LOOP using `rich.Live` ====
 try:
     with Live(refresh_per_second=1, screen=True) as live:
         while True:
             loop_start = time.time()
             panels = []
-
             # Network Tables
             if args.ib:
                 panels.append(Panel(make_ib_table(), title="InfiniBand"))
             else:
                 panels.append(Panel(make_net_table(), title="NIC"))
                 panels.append(Panel(make_rdma_table(), title="RDMA Priority"))
-
             # GPU Tables
+            row = [datetime.now().isoformat()] if args.dump else None
+
             if args.amd:
-                stats, amd_gpu_values, amd_count = get_amd_gpu_stats_rocml()
+                stats, amd_gpu_values, amd_count_local = get_amd_gpu_stats_rocml()
+                amd_count = amd_count_local  # update for CSV headers at shutdown
                 panels.append(Panel(make_amd_gpu_table(stats)))
-                row = [datetime.now().isoformat()] + amd_gpu_values if args.dump else None
+                if args.dump:
+                    row += amd_gpu_values
             elif args.nvidia:
                 gpu_stats = []
                 gpu_values = []
@@ -569,15 +749,20 @@ try:
                         f"{memory_clock}/{max_memory_clock} MHz"
                     ])
                 panels.append(Panel(make_nvidia_gpu_table(gpu_stats)))
-                row = [datetime.now().isoformat()] + gpu_values if args.dump else None
-            else:
-                row = None
+                if args.dump:
+                    row += gpu_values
+            # Network collection for dump
+            if args.dump:
+                if args.ib:
+                    row += sample_ib_values()
+                else:
+                    row += sample_nic_values()
+                    row += sample_rdma_values()
 
             live.update(Group(*panels))
 
             if args.dump and row:
                 archive_rows.append(row)
-
             intended_interval = 1  # seconds between updates
             elapsed = time.time() - loop_start
             if elapsed < intended_interval:
